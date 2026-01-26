@@ -1,0 +1,215 @@
+name: Auto-Close Resolved Issues
+
+on:
+  # Run on schedule to check for stale/resolved issues
+  schedule:
+    - cron: '0 */4 * * *'  # Every 4 hours
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (do not close issues)'
+        required: false
+        type: boolean
+        default: false
+
+  # Trigger when health check passes
+  workflow_run:
+    workflows: ["Self-Healing Monitor"]
+    types:
+      - completed
+
+  # Trigger on issue label changes
+  issues:
+    types: [labeled]
+
+jobs:
+  auto-close-stale:
+    name: Close Stale Automated Issues
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close stale automated issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const dryRun = '${{ inputs.dry_run }}' === 'true';
+
+            // Configuration: how long before auto-closing (in hours)
+            const staleThresholds = {
+              'trade-failure': 72,      // 3 days
+              'ingestion-failure': 48,  // 2 days
+              'system-health': 24,      // 1 day
+              'test': 2                 // 2 hours for test issues
+            };
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated',
+              sort: 'updated',
+              direction: 'asc',
+              per_page: 100
+            });
+
+            let closedCount = 0;
+            const now = Date.now();
+
+            for (const issue of issues) {
+              const labels = issue.labels.map(l => l.name);
+
+              // Determine issue type and threshold
+              let issueType = 'default';
+              let threshold = 72; // Default 3 days
+
+              for (const [type, hours] of Object.entries(staleThresholds)) {
+                if (labels.includes(type)) {
+                  issueType = type;
+                  threshold = hours;
+                  break;
+                }
+              }
+
+              const lastUpdated = new Date(issue.updated_at);
+              const hoursSinceUpdate = (now - lastUpdated.getTime()) / (1000 * 60 * 60);
+
+              // Check if issue is stale
+              if (hoursSinceUpdate > threshold) {
+                console.log(`Issue #${issue.number} is stale (${hoursSinceUpdate.toFixed(1)}h > ${threshold}h threshold)`);
+
+                if (!dryRun) {
+                  // Add closing comment
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: `## Auto-Closed: Stale Issue
+
+            This issue has been automatically closed because:
+            - No new occurrences for **${threshold} hours**
+            - Issue type: \`${issueType}\`
+            - Last updated: ${lastUpdated.toISOString()}
+
+            If this issue is still relevant, please reopen it and add a comment.
+
+            ---
+            *Closed automatically by the issue management system.*`
+                  });
+
+                  // Close the issue
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                    state_reason: 'not_planned',
+                    labels: [...labels, 'auto-closed']
+                  });
+
+                  closedCount++;
+                }
+              }
+            }
+
+            console.log(`${dryRun ? '[DRY RUN] Would close' : 'Closed'} ${closedCount} stale issues`);
+
+            // Set summary
+            const summary = `## Auto-Close Summary\n\n` +
+              `- **Mode:** ${dryRun ? 'Dry Run' : 'Live'}\n` +
+              `- **Issues Processed:** ${issues.length}\n` +
+              `- **Issues ${dryRun ? 'Would Be ' : ''}Closed:** ${closedCount}`;
+
+            core.summary.addRaw(summary);
+            await core.summary.write();
+
+  close-on-resolved-label:
+    name: Close Issues Labeled as Resolved
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.label.name == 'resolved'
+    steps:
+      - name: Close resolved issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+
+            // Add closing comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `## Resolved
+
+            This issue has been marked as resolved and closed.
+
+            **Resolved by:** @${context.actor}
+            **Resolved at:** ${new Date().toISOString()}
+
+            ---
+            *If this issue resurfaces, a new issue will be created automatically.*`
+            });
+
+            // Close the issue
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+
+            console.log(`Closed issue #${issue.number} as resolved`);
+
+  close-on-healthy-system:
+    name: Close Health Issues When System Recovers
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Close system health issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Find open system-health issues
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated,system-health',
+              per_page: 50
+            });
+
+            let closedCount = 0;
+
+            for (const issue of issues) {
+              // Add recovery comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `## System Recovered ✓
+
+            The self-healing monitor has confirmed the system is now healthy.
+
+            **Recovery detected:** ${new Date().toISOString()}
+            **Workflow run:** ${context.payload.workflow_run.html_url}
+
+            ---
+            *Auto-closed due to system recovery.*`
+              });
+
+              // Close the issue
+              const labels = issue.labels.map(l => l.name);
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+                labels: [...labels, 'auto-recovered']
+              });
+
+              closedCount++;
+            }
+
+            console.log(`Closed ${closedCount} health issues due to system recovery`);

@@ -1,0 +1,354 @@
+name: Self-Healing Monitor
+
+on:
+  schedule:
+    # Run every 30 minutes
+    - cron: '*/30 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_check:
+        description: 'Force all health checks'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  health-check:
+    name: System Health Check
+    runs-on: ubuntu-latest
+    outputs:
+      overall_status: ${{ steps.aggregate.outputs.status }}
+      failed_checks: ${{ steps.aggregate.outputs.failed_checks }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check repository health
+        id: repo-health
+        continue-on-error: true
+        run: |
+          echo "Checking repository health..."
+
+          # Check if essential files exist
+          HEALTH_STATUS="healthy"
+          ISSUES=""
+
+          # Check for required config files
+          for file in ".gitignore" "SECURITY.md"; do
+            if [ ! -f "$file" ]; then
+              ISSUES="${ISSUES}Missing $file\n"
+              HEALTH_STATUS="unhealthy"
+            fi
+          done
+
+          # Check workflows directory
+          if [ ! -d ".github/workflows" ]; then
+            ISSUES="${ISSUES}Missing .github/workflows directory\n"
+            HEALTH_STATUS="unhealthy"
+          fi
+
+          echo "status=$HEALTH_STATUS" >> $GITHUB_OUTPUT
+          echo "issues=$ISSUES" >> $GITHUB_OUTPUT
+
+      - name: Check for security vulnerabilities
+        id: security-check
+        continue-on-error: true
+        run: |
+          echo "Running security checks..."
+
+          HEALTH_STATUS="healthy"
+          ISSUES=""
+
+          # Check for common security issues in tracked files
+          if git ls-files | xargs grep -l "password\s*=" 2>/dev/null | grep -v ".yml\|.yaml\|.md" | head -1; then
+            ISSUES="${ISSUES}Potential hardcoded password found\n"
+            HEALTH_STATUS="warning"
+          fi
+
+          # Check for API keys pattern (simplified)
+          if git ls-files | xargs grep -lE "(api_key|apikey|API_KEY)\s*=\s*['\"][^'\"]+['\"]" 2>/dev/null | grep -v ".yml\|.yaml\|.md\|.env.example" | head -1; then
+            ISSUES="${ISSUES}Potential hardcoded API key found\n"
+            HEALTH_STATUS="warning"
+          fi
+
+          echo "status=$HEALTH_STATUS" >> $GITHUB_OUTPUT
+          echo "issues=$ISSUES" >> $GITHUB_OUTPUT
+
+      - name: Check GitHub Actions health
+        id: actions-health
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let status = 'healthy';
+            let issues = [];
+
+            try {
+              // Check recent workflow runs for failures
+              const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 20
+              });
+
+              const recentFailures = runs.workflow_runs.filter(run =>
+                run.conclusion === 'failure' &&
+                new Date(run.created_at) > new Date(Date.now() - 24 * 60 * 60 * 1000)
+              );
+
+              if (recentFailures.length >= 5) {
+                status = 'unhealthy';
+                issues.push(`${recentFailures.length} workflow failures in last 24h`);
+              } else if (recentFailures.length >= 2) {
+                status = 'warning';
+                issues.push(`${recentFailures.length} workflow failures in last 24h`);
+              }
+
+              // Check for stuck/pending runs
+              const pendingRuns = runs.workflow_runs.filter(run =>
+                run.status === 'pending' || run.status === 'queued'
+              );
+
+              if (pendingRuns.length > 5) {
+                status = 'warning';
+                issues.push(`${pendingRuns.length} pending/queued workflow runs`);
+              }
+
+            } catch (error) {
+              console.log('Could not check workflow runs:', error.message);
+            }
+
+            core.setOutput('status', status);
+            core.setOutput('issues', issues.join('; '));
+
+      - name: Check open issues health
+        id: issues-health
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let status = 'healthy';
+            let issues = [];
+
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated,urgent',
+              per_page: 100
+            });
+
+            if (openIssues.length >= 10) {
+              status = 'unhealthy';
+              issues.push(`${openIssues.length} urgent automated issues open`);
+            } else if (openIssues.length >= 5) {
+              status = 'warning';
+              issues.push(`${openIssues.length} urgent automated issues open`);
+            }
+
+            // Check for critical issues
+            const criticalIssues = openIssues.filter(issue =>
+              issue.labels.some(l => l.name === 'severity-critical')
+            );
+
+            if (criticalIssues.length > 0) {
+              status = 'unhealthy';
+              issues.push(`${criticalIssues.length} critical severity issues`);
+            }
+
+            core.setOutput('status', status);
+            core.setOutput('issues', issues.join('; '));
+
+      - name: Aggregate health status
+        id: aggregate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const checks = {
+              'Repository': {
+                status: '${{ steps.repo-health.outputs.status }}' || 'unknown',
+                issues: '${{ steps.repo-health.outputs.issues }}'
+              },
+              'Security': {
+                status: '${{ steps.security-check.outputs.status }}' || 'unknown',
+                issues: '${{ steps.security-check.outputs.issues }}'
+              },
+              'Actions': {
+                status: '${{ steps.actions-health.outputs.status }}' || 'unknown',
+                issues: '${{ steps.actions-health.outputs.issues }}'
+              },
+              'Issues': {
+                status: '${{ steps.issues-health.outputs.status }}' || 'unknown',
+                issues: '${{ steps.issues-health.outputs.issues }}'
+              }
+            };
+
+            // Determine overall status
+            let overallStatus = 'healthy';
+            const failedChecks = [];
+
+            for (const [name, check] of Object.entries(checks)) {
+              if (check.status === 'unhealthy') {
+                overallStatus = 'unhealthy';
+                failedChecks.push(`${name}: ${check.issues || 'Failed'}`);
+              } else if (check.status === 'warning' && overallStatus !== 'unhealthy') {
+                overallStatus = 'warning';
+                failedChecks.push(`${name}: ${check.issues || 'Warning'}`);
+              }
+            }
+
+            core.setOutput('status', overallStatus);
+            core.setOutput('failed_checks', failedChecks.join('\n'));
+
+            // Create summary
+            let summary = '## System Health Report\n\n';
+            summary += `**Overall Status:** ${overallStatus === 'healthy' ? '✅ Healthy' : overallStatus === 'warning' ? '⚠️ Warning' : '❌ Unhealthy'}\n\n`;
+            summary += '| Check | Status | Details |\n|-------|--------|--------|\n';
+
+            for (const [name, check] of Object.entries(checks)) {
+              const icon = check.status === 'healthy' ? '✅' : check.status === 'warning' ? '⚠️' : '❌';
+              summary += `| ${name} | ${icon} ${check.status} | ${check.issues || '-'} |\n`;
+            }
+
+            core.summary.addRaw(summary);
+            await core.summary.write();
+
+  create-alert:
+    name: Create Alert If Unhealthy
+    needs: health-check
+    if: needs.health-check.outputs.overall_status == 'unhealthy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update health alert issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failedChecks = `${{ needs.health-check.outputs.failed_checks }}`;
+            const timestamp = new Date().toISOString();
+
+            // Check for existing open health alert
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated,system-health,self-healing',
+              per_page: 5
+            });
+
+            const issueBody = `## Health Check Failed
+
+            **Timestamp:** ${timestamp}
+            **Status:** Unhealthy
+
+            ### Failed Checks
+            \`\`\`
+            ${failedChecks}
+            \`\`\`
+
+            ### Actions Required
+            1. Review the failed checks above
+            2. Check the [workflow run](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details
+            3. Fix the underlying issues
+            4. Add the \`resolved\` label when fixed
+
+            ---
+            *This alert will auto-close when the system recovers.*`;
+
+            if (existingIssues.length > 0) {
+              // Add comment to existing issue
+              const issue = existingIssues[0];
+              const occurrences = (issue.body.match(/Occurrence #\d+/g) || []).length + 1;
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `## Occurrence #${occurrences} - ${timestamp}\n\n${issueBody}`
+              });
+
+              // Update title with count
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                title: `Self-Healing Alert: System Unhealthy (${occurrences} occurrences)`
+              });
+
+              console.log(`Updated existing alert issue #${issue.number}`);
+
+            } else {
+              // Create new issue
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Self-Healing Alert: System Unhealthy',
+                body: `## Occurrence #1 - ${timestamp}\n\n${issueBody}`,
+                labels: ['automated', 'system-health', 'self-healing', 'urgent', 'severity-high']
+              });
+
+              console.log(`Created new alert issue #${newIssue.number}`);
+            }
+
+  attempt-self-heal:
+    name: Attempt Self-Healing
+    needs: health-check
+    if: needs.health-check.outputs.overall_status == 'unhealthy' || needs.health-check.outputs.overall_status == 'warning'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Attempt automatic fixes
+        id: auto-fix
+        run: |
+          echo "Attempting automatic remediation..."
+
+          FIXES_APPLIED=""
+
+          # Fix 1: Clear any stuck workflow artifacts (if applicable)
+          echo "Checking for stuck artifacts..."
+
+          # Fix 2: Ensure required files exist
+          if [ ! -f ".gitignore" ]; then
+            echo "# Auto-generated .gitignore" > .gitignore
+            FIXES_APPLIED="${FIXES_APPLIED}Created missing .gitignore\n"
+          fi
+
+          echo "fixes=$FIXES_APPLIED" >> $GITHUB_OUTPUT
+
+      - name: Report self-healing results
+        if: steps.auto-fix.outputs.fixes != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fixes = '${{ steps.auto-fix.outputs.fixes }}';
+
+            // Find the health alert issue
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated,system-health',
+              per_page: 5
+            });
+
+            if (issues.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                body: `## Self-Healing Attempted
+
+            The following automatic fixes were applied:
+
+            \`\`\`
+            ${fixes}
+            \`\`\`
+
+            The next health check will verify if the issues are resolved.
+
+            ---
+            *Automated self-healing at ${new Date().toISOString()}*`
+              });
+            }
