@@ -1,0 +1,240 @@
+name: Intelligent Issue Management
+
+on:
+  workflow_call:
+    inputs:
+      issue_type:
+        description: 'Type of issue (trade-failure, ingestion-failure, system-health)'
+        required: true
+        type: string
+      title:
+        description: 'Issue title'
+        required: true
+        type: string
+      body:
+        description: 'Issue body content'
+        required: true
+        type: string
+      labels:
+        description: 'Comma-separated labels'
+        required: false
+        type: string
+        default: 'automated'
+      severity:
+        description: 'Severity level (low, medium, high, critical)'
+        required: false
+        type: string
+        default: 'medium'
+    outputs:
+      issue_number:
+        description: 'The issue number (new or existing)'
+        value: ${{ jobs.manage-issue.outputs.issue_number }}
+      action_taken:
+        description: 'Action taken (created, updated, grouped)'
+        value: ${{ jobs.manage-issue.outputs.action_taken }}
+
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      issue_type:
+        description: 'Type of issue'
+        required: true
+        type: choice
+        options:
+          - trade-failure
+          - ingestion-failure
+          - system-health
+          - test
+      title:
+        description: 'Issue title'
+        required: true
+        type: string
+      body:
+        description: 'Issue body'
+        required: true
+        type: string
+      severity:
+        description: 'Severity level'
+        required: true
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+
+jobs:
+  manage-issue:
+    name: Manage Issue Intelligently
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.handle-issue.outputs.issue_number }}
+      action_taken: ${{ steps.handle-issue.outputs.action_taken }}
+
+    steps:
+      - name: Check for existing similar issues
+        id: find-existing
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueType = '${{ inputs.issue_type }}';
+            const title = '${{ inputs.title }}';
+            const severity = '${{ inputs.severity }}' || 'medium';
+
+            // Define grouping windows based on issue type (in hours)
+            const groupingWindows = {
+              'trade-failure': 24,      // Group trade failures within 24 hours
+              'ingestion-failure': 12,  // Group ingestion failures within 12 hours
+              'system-health': 6,       // Group health alerts within 6 hours
+              'test': 1                 // Test issues group within 1 hour
+            };
+
+            const windowHours = groupingWindows[issueType] || 12;
+            const cutoffDate = new Date(Date.now() - windowHours * 60 * 60 * 1000);
+
+            // Search for open issues with the same type label
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: `automated,${issueType}`,
+              sort: 'created',
+              direction: 'desc',
+              per_page: 10
+            });
+
+            // Find issues within the grouping window with similar titles
+            const titleKeywords = title.toLowerCase().split(/[\s\-_]+/).filter(w => w.length > 3);
+
+            for (const issue of issues) {
+              const issueDate = new Date(issue.created_at);
+              if (issueDate < cutoffDate) continue;
+
+              // Check title similarity (at least 50% keyword match)
+              const issueTitleWords = issue.title.toLowerCase().split(/[\s\-_]+/);
+              const matchCount = titleKeywords.filter(kw =>
+                issueTitleWords.some(tw => tw.includes(kw) || kw.includes(tw))
+              ).length;
+
+              const similarity = titleKeywords.length > 0 ? matchCount / titleKeywords.length : 0;
+
+              if (similarity >= 0.5) {
+                core.setOutput('existing_issue', issue.number);
+                core.setOutput('existing_title', issue.title);
+                core.setOutput('occurrence_count', (issue.body.match(/Occurrence #\d+/g) || []).length + 1);
+                return;
+              }
+            }
+
+            core.setOutput('existing_issue', '');
+            core.setOutput('occurrence_count', 1);
+
+      - name: Handle issue (create or update)
+        id: handle-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const existingIssue = '${{ steps.find-existing.outputs.existing_issue }}';
+            const occurrenceCount = parseInt('${{ steps.find-existing.outputs.occurrence_count }}') || 1;
+            const issueType = '${{ inputs.issue_type }}';
+            const title = '${{ inputs.title }}';
+            const body = '${{ inputs.body }}';
+            const severity = '${{ inputs.severity }}' || 'medium';
+            const labelsInput = '${{ inputs.labels }}' || 'automated';
+
+            const timestamp = new Date().toISOString();
+            const labels = [...new Set([
+              'automated',
+              issueType,
+              `severity-${severity}`,
+              ...labelsInput.split(',').map(l => l.trim()).filter(Boolean)
+            ])];
+
+            // Add urgent label for high/critical severity
+            if (severity === 'high' || severity === 'critical') {
+              labels.push('urgent');
+            }
+
+            if (existingIssue) {
+              // Update existing issue with new occurrence
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(existingIssue)
+              });
+
+              const newComment = `## Occurrence #${occurrenceCount} - ${timestamp}
+
+            ${body}
+
+            ---
+            *This occurrence was automatically grouped with the parent issue.*`;
+
+              // Add comment to existing issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(existingIssue),
+                body: newComment
+              });
+
+              // Update issue title with occurrence count
+              const updatedTitle = issue.title.replace(/ \(\d+ occurrences?\)$/, '') +
+                ` (${occurrenceCount} occurrences)`;
+
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt(existingIssue),
+                title: updatedTitle,
+                labels: labels
+              });
+
+              core.setOutput('issue_number', existingIssue);
+              core.setOutput('action_taken', 'grouped');
+              console.log(`Grouped with existing issue #${existingIssue} (occurrence #${occurrenceCount})`);
+
+            } else {
+              // Create new issue
+              const issueBody = `## Automated Alert - ${issueType}
+
+            **Severity:** ${severity}
+            **First Detected:** ${timestamp}
+            **Type:** ${issueType}
+
+            ---
+
+            ## Occurrence #1 - ${timestamp}
+
+            ${body}
+
+            ---
+
+            ### Auto-Management Info
+            - Similar issues will be grouped here automatically
+            - This issue will auto-close when the system reports healthy status
+            - Use the \`resolved\` label to manually mark as fixed
+
+            *This issue was created automatically by the monitoring system.*`;
+
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: issueBody,
+                labels: labels
+              });
+
+              core.setOutput('issue_number', newIssue.number);
+              core.setOutput('action_taken', 'created');
+              console.log(`Created new issue #${newIssue.number}`);
+            }
+
+      - name: Summary
+        run: |
+          echo "## Issue Management Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action:** ${{ steps.handle-issue.outputs.action_taken }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Issue Number:** #${{ steps.handle-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ inputs.issue_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Severity:** ${{ inputs.severity }}" >> $GITHUB_STEP_SUMMARY

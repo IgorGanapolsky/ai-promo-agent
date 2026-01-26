@@ -1,0 +1,57 @@
+name: Automated Alert
+description: Template for automated system alerts (internal use)
+title: "[Alert]: "
+labels: ["automated"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is used by automated workflows. Manual creation is not recommended.
+
+  - type: dropdown
+    id: alert_type
+    attributes:
+      label: Alert Type
+      options:
+        - trade-failure
+        - ingestion-failure
+        - system-health
+        - security-alert
+        - dependency-alert
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - low
+        - medium
+        - high
+        - critical
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Alert Description
+      description: Detailed description of the alert
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Additional context, logs, or error messages
+      render: shell
+
+  - type: textarea
+    id: remediation
+    attributes:
+      label: Suggested Remediation
+      description: Steps to resolve this alert

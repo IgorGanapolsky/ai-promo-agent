@@ -1,0 +1,226 @@
+name: Create Alert
+
+# Reusable workflow for creating intelligent, grouped alerts
+# Usage from another workflow:
+#
+#   jobs:
+#     notify-failure:
+#       uses: ./.github/workflows/create-alert.yml
+#       with:
+#         alert_type: trade-failure
+#         title: "Trade Execution Failed - ${{ github.run_id }}"
+#         body: "Trade failed with error: ..."
+#         severity: high
+
+on:
+  workflow_call:
+    inputs:
+      alert_type:
+        description: 'Type of alert (trade-failure, ingestion-failure, system-health, security, custom)'
+        required: true
+        type: string
+      title:
+        description: 'Alert title'
+        required: true
+        type: string
+      body:
+        description: 'Alert body/description'
+        required: true
+        type: string
+      severity:
+        description: 'Severity level (low, medium, high, critical)'
+        required: false
+        type: string
+        default: 'medium'
+      additional_labels:
+        description: 'Additional comma-separated labels'
+        required: false
+        type: string
+        default: ''
+      grouping_window_hours:
+        description: 'Hours to group similar alerts (default varies by type)'
+        required: false
+        type: number
+        default: 0
+    outputs:
+      issue_number:
+        description: 'Created or updated issue number'
+        value: ${{ jobs.create-alert.outputs.issue_number }}
+      issue_url:
+        description: 'Issue URL'
+        value: ${{ jobs.create-alert.outputs.issue_url }}
+      was_grouped:
+        description: 'Whether this was grouped with existing issue'
+        value: ${{ jobs.create-alert.outputs.was_grouped }}
+
+jobs:
+  create-alert:
+    name: Create or Group Alert
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.create.outputs.issue_number }}
+      issue_url: ${{ steps.create.outputs.issue_url }}
+      was_grouped: ${{ steps.create.outputs.was_grouped }}
+
+    steps:
+      - name: Create or update alert
+        id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alertType = '${{ inputs.alert_type }}';
+            const title = '${{ inputs.title }}';
+            const body = '${{ inputs.body }}';
+            const severity = '${{ inputs.severity }}' || 'medium';
+            const additionalLabels = '${{ inputs.additional_labels }}'.split(',').filter(Boolean);
+            let groupingWindowHours = parseInt('${{ inputs.grouping_window_hours }}') || 0;
+
+            // Default grouping windows by alert type
+            const defaultWindows = {
+              'trade-failure': 24,
+              'ingestion-failure': 12,
+              'system-health': 6,
+              'security': 48,
+              'custom': 12
+            };
+
+            if (groupingWindowHours === 0) {
+              groupingWindowHours = defaultWindows[alertType] || 12;
+            }
+
+            const timestamp = new Date().toISOString();
+            const cutoffTime = new Date(Date.now() - groupingWindowHours * 60 * 60 * 1000);
+
+            // Build labels
+            const labels = [
+              'automated',
+              alertType,
+              `severity-${severity}`,
+              ...additionalLabels.map(l => l.trim())
+            ];
+
+            if (severity === 'high' || severity === 'critical') {
+              labels.push('urgent');
+            }
+
+            // Search for existing similar issues
+            const { data: existingIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: `automated,${alertType}`,
+              sort: 'created',
+              direction: 'desc',
+              per_page: 20
+            });
+
+            // Find groupable issue
+            let targetIssue = null;
+            const titleWords = title.toLowerCase().split(/[\s\-_:]+/).filter(w => w.length > 2);
+
+            for (const issue of existingIssues) {
+              const issueDate = new Date(issue.created_at);
+              if (issueDate < cutoffTime) continue;
+
+              const issueWords = issue.title.toLowerCase().split(/[\s\-_:]+/);
+              const matchCount = titleWords.filter(w =>
+                issueWords.some(iw => iw.includes(w) || w.includes(iw))
+              ).length;
+
+              if (titleWords.length > 0 && matchCount / titleWords.length >= 0.4) {
+                targetIssue = issue;
+                break;
+              }
+            }
+
+            if (targetIssue) {
+              // Group with existing issue
+              const currentBody = targetIssue.body || '';
+              const occurrenceMatches = currentBody.match(/## Occurrence #(\d+)/g) || [];
+              const occurrenceCount = occurrenceMatches.length + 1;
+
+              // Add comment with new occurrence
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: targetIssue.number,
+                body: `## Occurrence #${occurrenceCount} - ${timestamp}
+
+            ${body}
+
+            **Severity:** ${severity}
+            **Workflow Run:** [${context.runId}](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+
+            ---
+            *Automatically grouped with parent alert*`
+              });
+
+              // Update title with occurrence count
+              const baseTitle = targetIssue.title.replace(/ \(\d+ occurrences?\)$/, '');
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: targetIssue.number,
+                title: `${baseTitle} (${occurrenceCount} occurrences)`,
+                labels: [...new Set([...targetIssue.labels.map(l => l.name), ...labels])]
+              });
+
+              core.setOutput('issue_number', targetIssue.number);
+              core.setOutput('issue_url', targetIssue.html_url);
+              core.setOutput('was_grouped', 'true');
+
+              console.log(`Grouped with issue #${targetIssue.number} (occurrence ${occurrenceCount})`);
+
+            } else {
+              // Create new issue
+              const newBody = `## Automated Alert
+
+            | Field | Value |
+            |-------|-------|
+            | **Type** | \`${alertType}\` |
+            | **Severity** | ${severity} |
+            | **First Detected** | ${timestamp} |
+            | **Grouping Window** | ${groupingWindowHours} hours |
+
+            ---
+
+            ## Occurrence #1 - ${timestamp}
+
+            ${body}
+
+            **Workflow Run:** [${context.runId}](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+
+            ---
+
+            ### Alert Management
+
+            - Similar alerts within ${groupingWindowHours}h will be grouped here
+            - Add \`resolved\` label to close when fixed
+            - Auto-closes after ${defaultWindows[alertType] * 3 || 36}h of inactivity
+
+            *Created automatically by monitoring system*`;
+
+              const { data: newIssue } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: newBody,
+                labels: [...new Set(labels)]
+              });
+
+              core.setOutput('issue_number', newIssue.number);
+              core.setOutput('issue_url', newIssue.html_url);
+              core.setOutput('was_grouped', 'false');
+
+              console.log(`Created new issue #${newIssue.number}`);
+            }
+
+      - name: Add summary
+        run: |
+          echo "## Alert Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Issue:** #${{ steps.create.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** ${{ steps.create.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Grouped:** ${{ steps.create.outputs.was_grouped }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ inputs.alert_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Severity:** ${{ inputs.severity }}" >> $GITHUB_STEP_SUMMARY

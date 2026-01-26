@@ -1,0 +1,128 @@
+name: Example Workflow with Alerts
+
+# This is an example showing how to integrate the alert system
+# into your workflows. Delete or modify this file as needed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: 'Simulate a failure to test alerting'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  example-job:
+    name: Example Job
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.run.outputs.status }}
+      error_message: ${{ steps.run.outputs.error_message }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run example task
+        id: run
+        run: |
+          if [ "${{ inputs.simulate_failure }}" == "true" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "error_message=Simulated failure for testing alert system" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "Task completed successfully!"
+          fi
+
+  # Alert on failure - uses the reusable workflow
+  alert-on-failure:
+    name: Create Alert on Failure
+    needs: example-job
+    if: failure()
+    uses: ./.github/workflows/create-alert.yml
+    with:
+      alert_type: custom
+      title: "Example Workflow Failed - ${{ github.run_number }}"
+      body: |
+        The example workflow has failed.
+
+        **Error:** ${{ needs.example-job.outputs.error_message || 'Unknown error' }}
+        **Commit:** ${{ github.sha }}
+        **Branch:** ${{ github.ref_name }}
+        **Actor:** @${{ github.actor }}
+      severity: medium
+      additional_labels: "example,ci-failure"
+
+  # Example of trade execution with alerting
+  trade-execution-example:
+    name: Trade Execution Example
+    runs-on: ubuntu-latest
+    if: false  # Disabled by default - enable for your use case
+
+    steps:
+      - name: Execute trade
+        id: trade
+        run: |
+          # Your trade execution logic here
+          echo "Executing trade..."
+
+          # Simulate random failure
+          if [ $((RANDOM % 3)) -eq 0 ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "error=Connection timeout to exchange API" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+  alert-trade-failure:
+    name: Alert Trade Failure
+    needs: trade-execution-example
+    if: failure()
+    uses: ./.github/workflows/create-alert.yml
+    with:
+      alert_type: trade-failure
+      title: "Trade Execution Failed - ${{ github.run_id }}"
+      body: |
+        Trade execution failed.
+
+        **Error:** ${{ needs.trade-execution-example.outputs.error || 'Unknown error' }}
+        **Time:** ${{ github.event.head_commit.timestamp || 'N/A' }}
+
+        ### Trade Details
+        - Run ID: ${{ github.run_id }}
+        - Attempt: ${{ github.run_attempt }}
+      severity: high
+      additional_labels: "trading"
+
+  # Example of data ingestion with alerting
+  ingestion-example:
+    name: Data Ingestion Example
+    runs-on: ubuntu-latest
+    if: false  # Disabled by default
+
+    steps:
+      - name: Ingest data
+        id: ingest
+        run: |
+          # Your ingestion logic here
+          echo "Ingesting data..."
+          echo "status=success" >> $GITHUB_OUTPUT
+
+  alert-ingestion-failure:
+    name: Alert Ingestion Failure
+    needs: ingestion-example
+    if: failure()
+    uses: ./.github/workflows/create-alert.yml
+    with:
+      alert_type: ingestion-failure
+      title: "Data Ingestion Failed"
+      body: |
+        Data ingestion pipeline has failed.
+
+        **Source:** Example data source
+        **Error:** ${{ needs.ingestion-example.outputs.error || 'Unknown error' }}
+      severity: medium
+      additional_labels: "data-pipeline"
