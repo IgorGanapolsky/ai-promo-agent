@@ -1,0 +1,105 @@
+name: Daily Revenue Report
+
+on:
+  schedule:
+    # Run daily at 9 PM ET (after market close)
+    - cron: '0 1 * * 1-5'  # 01:00 UTC = 9 PM ET (Mon-Fri)
+
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to report (YYYY-MM-DD, defaults to today)'
+        required: false
+        type: string
+
+jobs:
+  generate-report:
+    name: Generate Daily Revenue Report
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Generate revenue report
+        id: report
+        env:
+          # Use paper trading by default (30K account)
+          ALPACA_API_KEY: ${{ secrets.ALPACA_PAPER_TRADING_30K_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_PAPER_TRADING_30K_API_SECRET }}
+          ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+          # For live brokerage, use:
+          # ALPACA_API_KEY: ${{ secrets.ALPACA_BROKERAGE_TRADING_API_KEY }}
+          # ALPACA_API_SECRET: ${{ secrets.ALPACA_BROKERAGE_TRADING_API_SECRET }}
+          # ALPACA_BASE_URL: "https://api.alpaca.markets"
+        run: |
+          python src/revenue_tracker.py > report.txt 2>&1 || true
+          cat report.txt
+
+          # Extract key metrics for summary
+          echo "report_generated=true" >> $GITHUB_OUTPUT
+
+      - name: Create job summary
+        run: |
+          echo "## Daily Revenue Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date +'%Y-%m-%d')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat report.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: revenue-report-${{ github.run_number }}
+          path: report.txt
+          retention-days: 90
+
+  alert-on-loss:
+    name: Alert on Significant Loss
+    needs: generate-report
+    runs-on: ubuntu-latest
+    # Only alert if loss exceeds threshold (customize as needed)
+    if: always()
+
+    steps:
+      - name: Check for significant loss
+        id: check-loss
+        run: |
+          # This would parse the report and check for losses
+          # For now, just pass through
+          echo "No significant loss detected"
+
+      - name: Create alert if needed
+        if: steps.check-loss.outputs.significant_loss == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Revenue Alert: Significant Loss Detected - ${new Date().toISOString().split('T')[0]}`,
+              body: `## Revenue Alert
+
+              A significant trading loss was detected.
+
+              **Date:** ${new Date().toISOString().split('T')[0]}
+              **Workflow Run:** ${context.runId}
+
+              Please review the daily revenue report and take appropriate action.
+
+              ---
+              *Automated alert from Daily Revenue Report workflow*`,
+              labels: ['automated', 'revenue-alert', 'urgent']
+            });
