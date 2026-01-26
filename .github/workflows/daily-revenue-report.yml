@@ -34,9 +34,14 @@ jobs:
       - name: Generate revenue report
         id: report
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
-          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+          # Use paper trading by default (30K account)
+          ALPACA_API_KEY: ${{ secrets.ALPACA_PAPER_TRADING_30K_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_PAPER_TRADING_30K_API_SECRET }}
+          ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+          # For live brokerage, use:
+          # ALPACA_API_KEY: ${{ secrets.ALPACA_BROKERAGE_TRADING_API_KEY }}
+          # ALPACA_API_SECRET: ${{ secrets.ALPACA_BROKERAGE_TRADING_API_SECRET }}
+          # ALPACA_BASE_URL: "https://api.alpaca.markets"
         run: |
           python src/revenue_tracker.py > report.txt 2>&1 || true
           cat report.txt
