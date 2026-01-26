@@ -50,7 +50,7 @@ jobs:
         run: bandit -r . -f json -o bandit-report.json --exit-zero || true
 
       - name: Upload Bandit Report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bandit-security-report
           path: bandit-report.json
