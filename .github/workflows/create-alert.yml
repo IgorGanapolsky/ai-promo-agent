@@ -65,7 +65,7 @@ jobs:
     steps:
       - name: Create or update alert
         id: create
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const alertType = '${{ inputs.alert_type }}';
