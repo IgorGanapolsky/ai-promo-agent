@@ -83,7 +83,7 @@ jobs:
 
       - name: Create alert if needed
         if: steps.check-loss.outputs.significant_loss == 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.issues.create({
