@@ -79,7 +79,7 @@ jobs:
       - name: Check GitHub Actions health
         id: actions-health
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             let status = 'healthy';
@@ -125,7 +125,7 @@ jobs:
 
       - name: Check open issues health
         id: issues-health
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             let status = 'healthy';
@@ -162,7 +162,7 @@ jobs:
 
       - name: Aggregate health status
         id: aggregate
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const checks = {
@@ -221,7 +221,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Create or update health alert issue
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const failedChecks = `${{ needs.health-check.outputs.failed_checks }}`;
@@ -319,7 +319,7 @@ jobs:
 
       - name: Report self-healing results
         if: steps.auto-fix.outputs.fixes != ''
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fixes = '${{ steps.auto-fix.outputs.fixes }}';
